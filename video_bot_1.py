@@ -42,37 +42,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Просто отправь ссылку — и готово!"
     )
 
-async def debug_formats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /formats <url> — показывает доступные форматы"""
-    args = context.args
-    if not args:
-        await update.message.reply_text("Использование: /formats <ссылка>")
-        return
-    url = args[0]
-    msg = await update.message.reply_text("🔍 Проверяю доступные форматы...")
-    try:
-        ydl_opts = {
-            'quiet': True,
-            'nocheckcertificate': True,
-            'skip_download': True,
-        }
-        if os.path.exists('cookies.txt'):
-            ydl_opts['cookiefile'] = 'cookies.txt'
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-        fmts = info.get('formats', [])
-        lines = []
-        for f in fmts[-20:]:  # последние 20
-            fid = f.get('format_id','?')
-            ext = f.get('ext','?')
-            h = f.get('height','?')
-            vcodec = f.get('vcodec','none')
-            acodec = f.get('acodec','none')
-            lines.append(f"{fid}: {ext} {h}p v={vcodec[:8]} a={acodec[:8]}")
-        await msg.edit_text("📋 Форматы:\n" + "\n".join(lines[-30:]))
-    except Exception as e:
-        await msg.edit_text(f"❌ {str(e)[:300]}")
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
     match = URL_PATTERN.search(text)
@@ -83,59 +52,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     url = match.group()
     platform = get_platform(url)
-    status_msg = await update.message.reply_text(f"{platform}\n⏳ Скачиваю...")
+    status_msg = await update.message.reply_text(f"{platform}\n⏳ Обрабатываю...")
 
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
-            output_path = os.path.join(tmpdir, '%(title).60s.%(ext)s')
+            output_template = os.path.join(tmpdir, '%(title).60s.%(ext)s')
 
-            base_opts = {
-                'outtmpl': output_path,
+            ydl_opts = {
+                'outtmpl': output_template,
+                'format': 'best[ext=mp4][height<=720]/best[height<=720]/best',
                 'merge_output_format': 'mp4',
                 'quiet': True,
                 'no_warnings': True,
                 'nocheckcertificate': True,
+                'socket_timeout': 30,
+                'retries': 3,
+                'fragment_retries': 3,
+                'skip_unavailable_fragments': True,
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': ['tv', 'android', 'web']
+                    }
+                }
             }
 
+            # 🔑 Подключаем куки, если файл есть
             if os.path.exists('cookies.txt'):
-                base_opts['cookiefile'] = 'cookies.txt'
+                ydl_opts['cookiefile'] = 'cookies.txt'
+                logger.info("Using cookies.txt for authentication")
 
-            # Сначала смотрим что реально доступно
-            with yt_dlp.YoutubeDL({**base_opts, 'skip_download': True}) as ydl:
-                info = ydl.extract_info(url, download=False)
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
 
-            fmts = info.get('formats', [])
-            # Берём format_id лучшего доступного формата
-            video_fmts = [f for f in fmts if f.get('vcodec','none') != 'none' and f.get('height')]
-            audio_fmts = [f for f in fmts if f.get('acodec','none') != 'none' and f.get('vcodec','none') == 'none']
-            combined_fmts = [f for f in fmts if f.get('vcodec','none') != 'none' and f.get('acodec','none') != 'none']
-
-            if video_fmts and audio_fmts:
-                best_v = sorted(video_fmts, key=lambda x: x.get('height',0), reverse=True)[0]
-                best_a = sorted(audio_fmts, key=lambda x: x.get('abr',0) or 0, reverse=True)[0]
-                chosen_format = f"{best_v['format_id']}+{best_a['format_id']}"
-            elif combined_fmts:
-                best = sorted(combined_fmts, key=lambda x: x.get('height',0), reverse=True)[0]
-                chosen_format = best['format_id']
-            elif fmts:
-                chosen_format = fmts[-1]['format_id']
-            else:
-                raise Exception("Нет доступных форматов")
-
-            logger.info(f"Chosen format: {chosen_format}")
-
-            download_opts = {**base_opts, 'format': chosen_format}
-            with yt_dlp.YoutubeDL(download_opts) as ydl:
-                ydl.download([url])
-
-            title = info.get('title', 'Видео')[:60]
-            duration = info.get('duration', 0)
-
-            files = os.listdir(tmpdir)
+            # Ищем скачанный файл
+            files = [f for f in os.listdir(tmpdir) if not f.endswith('.part')]
             if not files:
                 raise Exception("Файл не найден после загрузки")
 
             filepath = os.path.join(tmpdir, files[0])
+            title = info.get('title', 'Видео')[:60]
+            duration = info.get('duration', 0)
             filesize = os.path.getsize(filepath)
 
             if filesize > 50 * 1024 * 1024:
@@ -161,22 +117,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         err = str(e)
-        if 'Sign in' in err:
-            await status_msg.edit_text("❌ YouTube требует авторизацию — обнови cookies.txt")
+        if 'Sign in' in err or 'confirm you' in err or 'authorization' in err.lower():
+            await status_msg.edit_text("❌ YouTube требует авторизацию.\n✅ Проверь, что cookies.txt загружен в GitHub и актуален.")
         elif '403' in err or 'Forbidden' in err:
             await status_msg.edit_text("❌ Видео заблокировано или приватное")
+        elif 'format is not available' in err:
+            await status_msg.edit_text("❌ YouTube не отдаёт это видео в нужном формате. Попробуй другую ссылку.")
         elif 'too large' in err.lower():
             await status_msg.edit_text("❌ Файл слишком большой для Telegram (лимит 50MB)")
         else:
-            await status_msg.edit_text(f"❌ Ошибка загрузки:\n{err[:300]}")
+            await status_msg.edit_text(f"❌ Ошибка:\n{err[:250]}")
         logger.error(f"Error: {e}", exc_info=True)
 
 def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("formats", debug_formats))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
     print("🤖 Бот запущен! Нажми Ctrl+C для остановки.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
