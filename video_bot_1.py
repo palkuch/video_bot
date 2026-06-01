@@ -64,6 +64,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'outtmpl': output_path,
                 'merge_output_format': 'mp4',
                 'quiet': True,
+                'cookiefile': 'cookies.txt',
                 'no_warnings': True,
                 'max_filesize': 50 * 1024 * 1024,  # 50MB лимит Telegram
             }
