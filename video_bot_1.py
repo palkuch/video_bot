@@ -10,7 +10,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 TOKEN = "8766144410:AAG6_hzXnL1BFomrrG4DNA5KRwtb0c8a9Vg"
-COOKIES_FILE = "cookies.txt"
 
 URL_PATTERN = re.compile(
     r'https?://'
@@ -59,41 +58,50 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = os.path.join(tmpdir, '%(title).60s.%(ext)s')
 
-            # Пробуем форматы от лучшего к простому
-            format_attempts = [
-                'bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best',
-                'best[height<=720]/best',
-                'worst',
+            # Разные конфигурации — пробуем по очереди
+            attempts = [
+                {
+                    'format': 'best[ext=mp4]/best',
+                    'extractor_args': {'youtube': {'player_client': ['tv_embedded']}},
+                },
+                {
+                    'format': 'best[ext=mp4]/best',
+                    'extractor_args': {'youtube': {'player_client': ['android']}},
+                },
+                {
+                    'format': 'best',
+                    'extractor_args': {'youtube': {'player_client': ['tv_embedded', 'android', 'web']}},
+                },
             ]
 
-            ydl_opts = {
-                'format': format_attempts[0],
-                'outtmpl': output_path,
-                'merge_output_format': 'mp4',
-                'quiet': True,
-                'no_warnings': True,
-                'cookiefile': COOKIES_FILE if os.path.exists(COOKIES_FILE) else None,
-                'extractor_args': {'youtube': {'player_client': ['web', 'android']}},
-            }
-
-            # Убираем None значения
-            ydl_opts = {k: v for k, v in ydl_opts.items() if v is not None}
+            # Добавляем cookies если файл есть
+            cookies = 'cookies.txt' if os.path.exists('cookies.txt') else None
 
             downloaded = False
+            info = None
             last_error = None
 
-            for fmt in format_attempts:
+            for attempt in attempts:
                 try:
-                    ydl_opts['format'] = fmt
+                    ydl_opts = {
+                        'outtmpl': output_path,
+                        'merge_output_format': 'mp4',
+                        'quiet': True,
+                        'no_warnings': True,
+                        **attempt,
+                    }
+                    if cookies:
+                        ydl_opts['cookiefile'] = cookies
+
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                         info = ydl.extract_info(url, download=True)
                         downloaded = True
                         break
-                except yt_dlp.utils.DownloadError as e:
+                except Exception as e:
                     last_error = e
-                    # Очищаем tmpdir для следующей попытки
                     for f in os.listdir(tmpdir):
-                        os.remove(os.path.join(tmpdir, f))
+                        try: os.remove(os.path.join(tmpdir, f))
+                        except: pass
                     continue
 
             if not downloaded:
@@ -130,18 +138,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await status_msg.delete()
 
-    except yt_dlp.utils.DownloadError as e:
+    except Exception as e:
         err = str(e)
-        if '403' in err or 'Forbidden' in err:
+        if 'Sign in' in err:
+            await status_msg.edit_text("❌ YouTube требует авторизацию — обнови cookies.txt")
+        elif '403' in err or 'Forbidden' in err:
             await status_msg.edit_text("❌ Видео заблокировано или приватное")
         elif 'too large' in err.lower():
             await status_msg.edit_text("❌ Файл слишком большой для Telegram (лимит 50MB)")
-        elif 'Sign in' in err:
-            await status_msg.edit_text("❌ YouTube требует авторизацию — обнови cookies.txt")
         else:
             await status_msg.edit_text(f"❌ Ошибка загрузки:\n{err[:200]}")
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Что-то пошло не так:\n{str(e)[:200]}")
         logger.error(f"Error: {e}", exc_info=True)
 
 def main():
