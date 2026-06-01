@@ -58,42 +58,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = os.path.join(tmpdir, '%(title).60s.%(ext)s')
 
-            # Разные конфигурации — пробуем по очереди
-            attempts = [
-                {
-                    'format': 'best[ext=mp4]/best',
-                    'extractor_args': {'youtube': {'player_client': ['tv_embedded']}},
-                },
-                {
-                    'format': 'best[ext=mp4]/best',
-                    'extractor_args': {'youtube': {'player_client': ['android']}},
-                },
-                {
-                    'format': 'best',
-                    'extractor_args': {'youtube': {'player_client': ['tv_embedded', 'android', 'web']}},
-                },
-            ]
+            base_opts = {
+                'outtmpl': output_path,
+                'merge_output_format': 'mp4',
+                'quiet': True,
+                'no_warnings': True,
+                'nocheckcertificate': True,  # Фикс SSL на Railway
+            }
 
-            # Добавляем cookies если файл есть
-            cookies = 'cookies.txt' if os.path.exists('cookies.txt') else None
+            if os.path.exists('cookies.txt'):
+                base_opts['cookiefile'] = 'cookies.txt'
+
+            attempts = [
+                {**base_opts, 'format': 'best[ext=mp4]/best', 'extractor_args': {'youtube': {'player_client': ['tv_embedded']}}},
+                {**base_opts, 'format': 'best[ext=mp4]/best', 'extractor_args': {'youtube': {'player_client': ['android']}}},
+                {**base_opts, 'format': 'best'},
+            ]
 
             downloaded = False
             info = None
             last_error = None
 
-            for attempt in attempts:
+            for opts in attempts:
                 try:
-                    ydl_opts = {
-                        'outtmpl': output_path,
-                        'merge_output_format': 'mp4',
-                        'quiet': True,
-                        'no_warnings': True,
-                        **attempt,
-                    }
-                    if cookies:
-                        ydl_opts['cookiefile'] = cookies
-
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    with yt_dlp.YoutubeDL(opts) as ydl:
                         info = ydl.extract_info(url, download=True)
                         downloaded = True
                         break
