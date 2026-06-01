@@ -52,46 +52,58 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     url = match.group()
     platform = get_platform(url)
-    status_msg = await update.message.reply_text(f"{platform}\n⏳ Обрабатываю...")
+    status_msg = await update.message.reply_text(f"{platform}\n⏳ Проверяю доступ...")
 
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             output_template = os.path.join(tmpdir, '%(title).60s.%(ext)s')
 
-            # 🎯 Максимально совместимые настройки для YouTube
+            # 🔍 Сначала проверяем, доступен ли видео вообще
+            probe_opts = {
+                'quiet': True,
+                'skip_download': True,
+                'nocheckcertificate': True,
+                'socket_timeout': 20,
+                'extractor_args': {'youtube': {'player_client': 'web'}}
+            }
+            
+            # Проверяем куки
+            if os.path.exists('cookies.txt'):
+                probe_opts['cookiefile'] = 'cookies.txt'
+                logger.info("✓ cookies.txt найден, размер: %d байт", os.path.getsize('cookies.txt'))
+            else:
+                logger.warning("⚠ cookies.txt не найден — авторизованные видео не скачаются")
+
+            with yt_dlp.YoutubeDL(probe_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+
+            # 🎯 Формат: пробуем скачать готовый MP4, если нет — склеиваем
             ydl_opts = {
                 'outtmpl': output_template,
-                'format': 'best[ext=mp4][height<=720]/best[height<=480]/best',
+                'format': 'best[ext=mp4][height<=720]/best[height<=480]/bestvideo+bestaudio/best',
                 'merge_output_format': 'mp4',
                 'quiet': True,
                 'no_warnings': True,
                 'nocheckcertificate': True,
                 'socket_timeout': 40,
-                'retries': 5,
-                'fragment_retries': 5,
+                'retries': 3,
+                'fragment_retries': 3,
                 'skip_unavailable_fragments': True,
-                'no_playlist': True,  # не качать плейлисты целиком
-                'extractor_args': {
-                    'youtube': {
-                        'player_client': 'web',  # только web-клиент (работает с куками)
-                        'player_skip': ['webpage']  # ускоряет получение данных
-                    }
-                }
+                'no_playlist': True,
+                'extractor_args': {'youtube': {'player_client': 'web'}}
             }
 
-            # 🔑 Куки — только если файл есть
             if os.path.exists('cookies.txt'):
                 ydl_opts['cookiefile'] = 'cookies.txt'
-                logger.info("Using cookies.txt")
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
 
-            # Ищем скачанный файл
+            # Ищем файл
             files = [f for f in os.listdir(tmpdir) 
-                    if not f.endswith('.part') and f.endswith(('.mp4', '.mkv', '.webm', '.m4a'))]
+                    if not f.endswith('.part') and f.endswith(('.mp4', '.mkv', '.webm'))]
             if not files:
-                raise Exception("Файл не найден после загрузки")
+                raise Exception("Файл не создан")
 
             filepath = os.path.join(tmpdir, files[0])
             title = info.get('title', 'Видео')[:60]
@@ -123,18 +135,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         err = str(e)
         logger.error(f"Error: {e}", exc_info=True)
         
-        if 'n challenge' in err or 'JavaScript runtime' in err:
-            await status_msg.edit_text("❌ YouTube требует Node.js для расшифровки.\n✅ Добавь 'nodejs' в файл Aptfile на GitHub")
-        elif 'Sign in' in err or 'confirm you' in err:
-            await status_msg.edit_text("❌ YouTube требует авторизацию.\n✅ Обнови cookies.txt (куки живут ~7 дней)")
-        elif 'ffmpeg' in err.lower() or 'merge' in err.lower():
-            await status_msg.edit_text("❌ Не установлен ffmpeg.\n✅ Добавь 'ffmpeg' в Aptfile")
+        if 'Sign in' in err or 'confirm you' in err or 'authorization' in err.lower():
+            # 💡 Фоллбэк-совет
+            await status_msg.edit_text(
+                "❌ YouTube не принимает куки с этого сервера.\n\n"
+                "💡 Попробуй:\n"
+                "1. Отправить ссылку на *публичное* видео (не 18+, не региональное)\n"
+                "2. Или запустить бота локально — там куки работают ✅"
+            )
+        elif 'ffmpeg' in err.lower():
+            await status_msg.edit_text("❌ Не установлен ffmpeg. Проверь Dockerfile")
         elif 'format is not available' in err or 'Only images' in err:
-            await status_msg.edit_text("❌ Видео защищено или недоступно в твоём регионе.\n💡 Попробуй другую ссылку.")
+            await status_msg.edit_text("❌ Видео защищено или недоступно в регионе.\n💡 Попробуй другую ссылку.")
         elif 'Conflict' in err:
-            await status_msg.edit_text("❌ Бот запущен в двух местах.\n✅ Останови локальную копию, оставь только Railway")
-        elif '403' in err or 'Forbidden' in err:
-            await status_msg.edit_text("❌ Видео заблокировано автором")
+            await status_msg.edit_text("❌ Бот запущен в двух местах. Останови локальную копию.")
         else:
             await status_msg.edit_text(f"❌ Ошибка:\n{err[:200]}")
 
