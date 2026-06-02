@@ -2,6 +2,7 @@ import os
 import re
 import tempfile
 import logging
+import requests
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 import yt_dlp
@@ -10,10 +11,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 TOKEN = "8766144410:AAG6_hzXnL1BFomrrG4DNA5KRwtb0c8a9Vg"
-
-MAX_VIDEO_SIZE  = 50  * 1024 * 1024   # 50MB  — шлём как видео
-MAX_DOC_SIZE    = 1500 * 1024 * 1024  # 1.5GB — шлём как документ
-MAX_DL_SIZE     = 1500 * 1024 * 1024  # не скачиваем больше 1.5GB
 
 URL_PATTERN = re.compile(
     r'https?://'
@@ -32,25 +29,22 @@ def get_platform(url):
     if 'twitter' in url or 'x.com' in url or 't.co' in url: return '🐦 X (Twitter)'
     return '🌐 Видео'
 
-def make_opts(output_template, fmt, cookies=None):
-    opts = {
-        'outtmpl': output_template,
-        'format': fmt,
-        'merge_output_format': 'mp4',
-        'quiet': True,
-        'no_warnings': True,
-        'nocheckcertificate': True,
-        'socket_timeout': 60,
-        'retries': 3,
-        'fragment_retries': 3,
-        'skip_unavailable_fragments': True,
-        'no_playlist': True,
-        'max_filesize': MAX_DL_SIZE,
-        'extractor_args': {'youtube': {'player_client': 'web'}},
-    }
-    if cookies:
-        opts['cookiefile'] = cookies
-    return opts
+def upload_to_gofile(filepath):
+    """Загружаем файл на gofile.io и возвращаем ссылку"""
+    # Получаем лучший сервер
+    server_resp = requests.get('https://api.gofile.io/servers', timeout=10).json()
+    server = server_resp['data']['servers'][0]['name']
+
+    with open(filepath, 'rb') as f:
+        resp = requests.post(
+            f'https://{server}.gofile.io/contents/uploadfile',
+            files={'file': f},
+            timeout=300
+        ).json()
+
+    if resp.get('status') == 'ok':
+        return resp['data']['downloadPage']
+    raise Exception(f"Gofile error: {resp}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -59,7 +53,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎵 TikTok\n"
         "📸 Instagram\n"
         "🐦 X (Twitter)\n\n"
-        "Просто отправь ссылку — и готово!"
+        "Просто отправь ссылку — и готово!\n\n"
+        "📌 Видео до 50MB придут прямо в чат\n"
+        "📎 Большие видео — получишь ссылку для скачивания"
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -74,63 +70,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text(f"{platform}\n⏳ Скачиваю...")
     cookies = 'cookies.txt' if os.path.exists('cookies.txt') else None
 
-    # Лесенка качества: пробуем от лучшего к худшему
-    format_ladder = [
-        'best[ext=mp4][height<=720]/best[height<=720]',
-        'best[ext=mp4][height<=480]/best[height<=480]',
-        'best[ext=mp4][height<=360]/best[height<=360]',
-        'worst[ext=mp4]/worst',
-    ]
+    ydl_opts = {
+        'format': 'best[ext=mp4][height<=720]/best[height<=720]/best[ext=mp4]/best',
+        'merge_output_format': 'mp4',
+        'quiet': True,
+        'no_warnings': True,
+        'nocheckcertificate': True,
+        'socket_timeout': 60,
+        'retries': 3,
+        'no_playlist': True,
+        'extractor_args': {'youtube': {'player_client': 'web'}},
+    }
+    if cookies:
+        ydl_opts['cookiefile'] = cookies
 
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
-            output_template = os.path.join(tmpdir, '%(title).60s.%(ext)s')
-            info = None
-            filepath = None
+            ydl_opts['outtmpl'] = os.path.join(tmpdir, '%(title).60s.%(ext)s')
 
-            for fmt in format_ladder:
-                for f in os.listdir(tmpdir):
-                    try: os.remove(os.path.join(tmpdir, f))
-                    except: pass
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
 
-                try:
-                    with yt_dlp.YoutubeDL(make_opts(output_template, fmt, cookies)) as ydl:
-                        info = ydl.extract_info(url, download=True)
-                except Exception as e:
-                    logger.warning(f"Format {fmt} failed: {e}")
-                    continue
+            files = [f for f in os.listdir(tmpdir) if not f.endswith('.part')]
+            if not files:
+                raise Exception("Файл не найден после загрузки")
 
-                files = [f for f in os.listdir(tmpdir) if not f.endswith('.part')]
-                if not files:
-                    continue
-
-                fp = os.path.join(tmpdir, files[0])
-                size = os.path.getsize(fp)
-                logger.info(f"Format '{fmt}': {size/1024/1024:.1f}MB")
-
-                filepath = fp  # сохраняем всегда
-                if size <= MAX_VIDEO_SIZE:
-                    break  # отлично — влезает как видео
-
-            if not filepath or not info:
-                await status_msg.edit_text("❌ Не удалось скачать видео 😔")
-                return
-
+            filepath = os.path.join(tmpdir, files[0])
             title    = info.get('title', 'Видео')[:60]
             duration = info.get('duration', 0)
             filesize = os.path.getsize(filepath)
 
-            if filesize > MAX_DOC_SIZE:
-                await status_msg.edit_text(
-                    f"❌ Видео слишком большое ({filesize/1024/1024:.0f}MB)\n"
-                    "Попробуй более короткое видео 😔"
-                )
-                return
-
-            await status_msg.edit_text(f"{platform}\n📤 Отправляю...")
-
-            with open(filepath, 'rb') as f:
-                if filesize <= MAX_VIDEO_SIZE:
+            if filesize <= 50 * 1024 * 1024:
+                # Маленький — шлём прямо в Telegram
+                await status_msg.edit_text(f"{platform}\n📤 Отправляю...")
+                with open(filepath, 'rb') as f:
                     await update.message.reply_video(
                         video=f,
                         caption=f"{platform} · {title}",
@@ -139,16 +112,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         read_timeout=120,
                         write_timeout=120,
                     )
-                else:
-                    size_mb = filesize / 1024 / 1024
-                    await update.message.reply_document(
-                        document=f,
-                        caption=f"{platform} · {title}\n📎 Файл {size_mb:.0f}MB — скачай и открой",
-                        read_timeout=600,
-                        write_timeout=600,
-                    )
-
-            await status_msg.delete()
+                await status_msg.delete()
+            else:
+                # Большой — заливаем на gofile.io
+                await status_msg.edit_text(f"{platform}\n☁️ Загружаю на хостинг ({filesize/1024/1024:.0f}MB)...")
+                download_url = upload_to_gofile(filepath)
+                await status_msg.edit_text(
+                    f"{platform} · {title}\n\n"
+                    f"📥 Ссылка для скачивания:\n{download_url}\n\n"
+                    f"⚠️ Ссылка действует ~10 дней"
+                )
 
     except Exception as e:
         err = str(e)
@@ -159,8 +132,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_msg.edit_text("❌ Видео недоступно в этом регионе.")
         elif 'Conflict' in err:
             await status_msg.edit_text("❌ Бот запущен в двух местах одновременно.")
-        elif 'Entity Too Large' in err or 'Request Entity' in err:
-            await status_msg.edit_text("❌ Файл слишком большой даже для документа.\nПопробуй более короткое видео.")
+        elif 'Gofile' in err:
+            await status_msg.edit_text("❌ Ошибка загрузки на хостинг. Попробуй позже.")
         else:
             await status_msg.edit_text(f"❌ Ошибка:\n{err[:200]}")
 
