@@ -117,27 +117,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logger.info(f"Too large ({filesize/1024/1024:.0f}MB), trying lower quality...")
                     filepath = None  # Пробуем следующее качество
 
+            # Если даже worst не влез — берём что есть и шлём документом
             if not filepath:
-                await status_msg.edit_text(
-                    "❌ Видео слишком длинное даже в минимальном качестве.\n"
-                    "Telegram принимает максимум 50MB 😔"
-                )
+                for f in os.listdir(tmpdir):
+                    if not f.endswith('.part'):
+                        filepath = os.path.join(tmpdir, f)
+                        break
+
+            if not filepath:
+                await status_msg.edit_text("❌ Не удалось скачать видео 😔")
                 return
 
             title = info.get('title', 'Видео')[:60]
             duration = info.get('duration', 0)
+            filesize = os.path.getsize(filepath)
 
             await status_msg.edit_text(f"{platform}\n📤 Отправляю...")
 
             with open(filepath, 'rb') as f:
-                await update.message.reply_video(
-                    video=f,
-                    caption=f"{platform} · {title}",
-                    duration=duration,
-                    supports_streaming=True,
-                    read_timeout=120,
-                    write_timeout=120,
-                )
+                if filesize <= 50 * 1024 * 1024:
+                    # До 50MB — отправляем как видео (воспроизводится прямо в чате)
+                    await update.message.reply_video(
+                        video=f,
+                        caption=f"{platform} · {title}",
+                        duration=duration,
+                        supports_streaming=True,
+                        read_timeout=120,
+                        write_timeout=120,
+                    )
+                else:
+                    # Больше 50MB — отправляем как документ (до 2GB)
+                    await update.message.reply_document(
+                        document=f,
+                        caption=f"{platform} · {title}\n📎 Отправлено как файл (>{filesize/1024/1024:.0f}MB)",
+                        read_timeout=300,
+                        write_timeout=300,
+                    )
 
             await status_msg.delete()
 
