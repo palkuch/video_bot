@@ -11,6 +11,10 @@ logger = logging.getLogger(__name__)
 
 TOKEN = "8766144410:AAG6_hzXnL1BFomrrG4DNA5KRwtb0c8a9Vg"
 
+MAX_VIDEO_SIZE  = 50  * 1024 * 1024   # 50MB  — шлём как видео
+MAX_DOC_SIZE    = 1500 * 1024 * 1024  # 1.5GB — шлём как документ
+MAX_DL_SIZE     = 1500 * 1024 * 1024  # не скачиваем больше 1.5GB
+
 URL_PATTERN = re.compile(
     r'https?://'
     r'(?:www\.)?'
@@ -21,16 +25,32 @@ URL_PATTERN = re.compile(
     r'\S+'
 )
 
-def get_platform(url: str) -> str:
-    if 'youtu' in url:
-        return '🎬 YouTube'
-    elif 'tiktok' in url:
-        return '🎵 TikTok'
-    elif 'instagram' in url:
-        return '📸 Instagram'
-    elif 'twitter' in url or 'x.com' in url or 't.co' in url:
-        return '🐦 X (Twitter)'
+def get_platform(url):
+    if 'youtu' in url:      return '🎬 YouTube'
+    if 'tiktok' in url:     return '🎵 TikTok'
+    if 'instagram' in url:  return '📸 Instagram'
+    if 'twitter' in url or 'x.com' in url or 't.co' in url: return '🐦 X (Twitter)'
     return '🌐 Видео'
+
+def make_opts(output_template, fmt, cookies=None):
+    opts = {
+        'outtmpl': output_template,
+        'format': fmt,
+        'merge_output_format': 'mp4',
+        'quiet': True,
+        'no_warnings': True,
+        'nocheckcertificate': True,
+        'socket_timeout': 60,
+        'retries': 3,
+        'fragment_retries': 3,
+        'skip_unavailable_fragments': True,
+        'no_playlist': True,
+        'max_filesize': MAX_DL_SIZE,
+        'extractor_args': {'youtube': {'player_client': 'web'}},
+    }
+    if cookies:
+        opts['cookiefile'] = cookies
+    return opts
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -42,29 +62,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Просто отправь ссылку — и готово!"
     )
 
-def build_opts(output_template, fmt, cookies=None):
-    opts = {
-        'outtmpl': output_template,
-        'format': fmt,
-        'merge_output_format': 'mp4',
-        'quiet': True,
-        'no_warnings': True,
-        'nocheckcertificate': True,
-        'socket_timeout': 40,
-        'retries': 3,
-        'fragment_retries': 3,
-        'skip_unavailable_fragments': True,
-        'no_playlist': True,
-        'extractor_args': {'youtube': {'player_client': 'web'}},
-    }
-    if cookies:
-        opts['cookiefile'] = cookies
-    return opts
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
     match = URL_PATTERN.search(text)
-
     if not match:
         await update.message.reply_text("Отправь мне ссылку на видео 👆")
         return
@@ -72,13 +72,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = match.group()
     platform = get_platform(url)
     status_msg = await update.message.reply_text(f"{platform}\n⏳ Скачиваю...")
-
     cookies = 'cookies.txt' if os.path.exists('cookies.txt') else None
 
-    # Пробуем качество по убыванию пока не влезет в 50MB
+    # Лесенка качества: пробуем от лучшего к худшему
     format_ladder = [
-        'best[ext=mp4][height<=720]/best[height<=720][ext=mp4]/best[height<=720]',
-        'best[ext=mp4][height<=480]/best[height<=480][ext=mp4]/best[height<=480]',
+        'best[ext=mp4][height<=720]/best[height<=720]',
+        'best[ext=mp4][height<=480]/best[height<=480]',
         'best[ext=mp4][height<=360]/best[height<=360]',
         'worst[ext=mp4]/worst',
     ]
@@ -90,53 +89,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             filepath = None
 
             for fmt in format_ladder:
-                # Очищаем tmpdir от предыдущей попытки
                 for f in os.listdir(tmpdir):
                     try: os.remove(os.path.join(tmpdir, f))
                     except: pass
 
                 try:
-                    with yt_dlp.YoutubeDL(build_opts(output_template, fmt, cookies)) as ydl:
+                    with yt_dlp.YoutubeDL(make_opts(output_template, fmt, cookies)) as ydl:
                         info = ydl.extract_info(url, download=True)
                 except Exception as e:
                     logger.warning(f"Format {fmt} failed: {e}")
                     continue
 
-                files = [f for f in os.listdir(tmpdir)
-                        if not f.endswith('.part') and f.endswith(('.mp4', '.mkv', '.webm'))]
+                files = [f for f in os.listdir(tmpdir) if not f.endswith('.part')]
                 if not files:
                     continue
 
-                filepath = os.path.join(tmpdir, files[0])
-                filesize = os.path.getsize(filepath)
-                logger.info(f"Downloaded with format '{fmt}': {filesize/1024/1024:.1f}MB")
+                fp = os.path.join(tmpdir, files[0])
+                size = os.path.getsize(fp)
+                logger.info(f"Format '{fmt}': {size/1024/1024:.1f}MB")
 
-                if filesize <= 50 * 1024 * 1024:
-                    break  # Влезает — отправляем!
-                else:
-                    logger.info(f"Too large ({filesize/1024/1024:.0f}MB), trying lower quality...")
-                    filepath = None  # Пробуем следующее качество
+                filepath = fp  # сохраняем всегда
+                if size <= MAX_VIDEO_SIZE:
+                    break  # отлично — влезает как видео
 
-            # Если даже worst не влез — берём что есть и шлём документом
-            if not filepath:
-                for f in os.listdir(tmpdir):
-                    if not f.endswith('.part'):
-                        filepath = os.path.join(tmpdir, f)
-                        break
-
-            if not filepath:
+            if not filepath or not info:
                 await status_msg.edit_text("❌ Не удалось скачать видео 😔")
                 return
 
-            title = info.get('title', 'Видео')[:60]
+            title    = info.get('title', 'Видео')[:60]
             duration = info.get('duration', 0)
             filesize = os.path.getsize(filepath)
+
+            if filesize > MAX_DOC_SIZE:
+                await status_msg.edit_text(
+                    f"❌ Видео слишком большое ({filesize/1024/1024:.0f}MB)\n"
+                    "Попробуй более короткое видео 😔"
+                )
+                return
 
             await status_msg.edit_text(f"{platform}\n📤 Отправляю...")
 
             with open(filepath, 'rb') as f:
-                if filesize <= 50 * 1024 * 1024:
-                    # До 50MB — отправляем как видео (воспроизводится прямо в чате)
+                if filesize <= MAX_VIDEO_SIZE:
                     await update.message.reply_video(
                         video=f,
                         caption=f"{platform} · {title}",
@@ -146,12 +140,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         write_timeout=120,
                     )
                 else:
-                    # Больше 50MB — отправляем как документ (до 2GB)
+                    size_mb = filesize / 1024 / 1024
                     await update.message.reply_document(
                         document=f,
-                        caption=f"{platform} · {title}\n📎 Отправлено как файл (>{filesize/1024/1024:.0f}MB)",
-                        read_timeout=300,
-                        write_timeout=300,
+                        caption=f"{platform} · {title}\n📎 Файл {size_mb:.0f}MB — скачай и открой",
+                        read_timeout=600,
+                        write_timeout=600,
                     )
 
             await status_msg.delete()
@@ -159,16 +153,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         err = str(e)
         logger.error(f"Error: {e}", exc_info=True)
-
-        if 'Sign in' in err or 'confirm you' in err or 'authorization' in err.lower():
-            await status_msg.edit_text(
-                "❌ YouTube не принимает куки с этого сервера.\n\n"
-                "💡 Попробуй публичное видео (не 18+, не региональное)"
-            )
-        elif 'format is not available' in err or 'Only images' in err:
-            await status_msg.edit_text("❌ Видео защищено или недоступно в регионе.")
+        if 'Sign in' in err or 'confirm you' in err:
+            await status_msg.edit_text("❌ YouTube требует авторизацию.\nПопробуй другое видео.")
+        elif 'format is not available' in err:
+            await status_msg.edit_text("❌ Видео недоступно в этом регионе.")
         elif 'Conflict' in err:
-            await status_msg.edit_text("❌ Бот запущен в двух местах. Останови локальную копию.")
+            await status_msg.edit_text("❌ Бот запущен в двух местах одновременно.")
+        elif 'Entity Too Large' in err or 'Request Entity' in err:
+            await status_msg.edit_text("❌ Файл слишком большой даже для документа.\nПопробуй более короткое видео.")
         else:
             await status_msg.edit_text(f"❌ Ошибка:\n{err[:200]}")
 
@@ -176,7 +168,7 @@ def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("🤖 Бот запущен! Нажми Ctrl+C для остановки.")
+    print("🤖 Бот запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
