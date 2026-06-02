@@ -30,18 +30,14 @@ def get_platform(url):
     return '🌐 Видео'
 
 def upload_to_gofile(filepath):
-    """Загружаем файл на gofile.io и возвращаем ссылку"""
-    # Получаем лучший сервер
     server_resp = requests.get('https://api.gofile.io/servers', timeout=10).json()
     server = server_resp['data']['servers'][0]['name']
-
     with open(filepath, 'rb') as f:
         resp = requests.post(
             f'https://{server}.gofile.io/contents/uploadfile',
             files={'file': f},
             timeout=300
         ).json()
-
     if resp.get('status') == 'ok':
         return resp['data']['downloadPage']
     raise Exception(f"Gofile error: {resp}")
@@ -49,13 +45,13 @@ def upload_to_gofile(filepath):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привет! Я скачиваю видео из:\n\n"
-        "🎬 YouTube\n"
+        "🎬 YouTube + Shorts\n"
         "🎵 TikTok\n"
         "📸 Instagram\n"
         "🐦 X (Twitter)\n\n"
         "Просто отправь ссылку — и готово!\n\n"
-        "📌 Видео до 50MB придут прямо в чат\n"
-        "📎 Большие видео — получишь ссылку для скачивания"
+        "📌 До 50MB — прямо в чат\n"
+        "📎 Больше 50MB — ссылка для скачивания"
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -67,29 +63,51 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     url = match.group()
     platform = get_platform(url)
+    is_shorts = 'shorts' in url.lower()
     status_msg = await update.message.reply_text(f"{platform}\n⏳ Скачиваю...")
     cookies = 'cookies.txt' if os.path.exists('cookies.txt') else None
 
-    ydl_opts = {
-        'format': 'best[ext=mp4][height<=720]/best[height<=720]/best[ext=mp4]/best',
-        'merge_output_format': 'mp4',
-        'quiet': True,
-        'no_warnings': True,
-        'nocheckcertificate': True,
-        'socket_timeout': 60,
-        'retries': 3,
-        'no_playlist': True,
-        'extractor_args': {'youtube': {'player_client': 'web'}},
-    }
-    if cookies:
-        ydl_opts['cookiefile'] = cookies
+    # Для Shorts пробуем разные клиенты по очереди
+    client_attempts = [['tv_embedded'], ['android'], ['web']] if is_shorts else [['web'], ['android']]
 
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
-            ydl_opts['outtmpl'] = os.path.join(tmpdir, '%(title).60s.%(ext)s')
+            outtmpl = os.path.join(tmpdir, '%(title).60s.%(ext)s')
+            info = None
+            downloaded = False
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
+            for clients in client_attempts:
+                for f in os.listdir(tmpdir):
+                    try: os.remove(os.path.join(tmpdir, f))
+                    except: pass
+
+                ydl_opts = {
+                    'outtmpl': outtmpl,
+                    'format': 'best[ext=mp4][height<=720]/best[height<=720]/best[ext=mp4]/best',
+                    'merge_output_format': 'mp4',
+                    'quiet': True,
+                    'no_warnings': True,
+                    'nocheckcertificate': True,
+                    'socket_timeout': 60,
+                    'retries': 3,
+                    'no_playlist': True,
+                    'extractor_args': {'youtube': {'player_client': clients}},
+                }
+                if cookies:
+                    ydl_opts['cookiefile'] = cookies
+
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(url, download=True)
+                    downloaded = True
+                    logger.info(f"Downloaded with clients {clients}")
+                    break
+                except Exception as e:
+                    logger.warning(f"Clients {clients} failed: {e}")
+                    continue
+
+            if not downloaded or not info:
+                raise Exception("Не удалось скачать ни одним способом")
 
             files = [f for f in os.listdir(tmpdir) if not f.endswith('.part')]
             if not files:
@@ -101,7 +119,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             filesize = os.path.getsize(filepath)
 
             if filesize <= 50 * 1024 * 1024:
-                # Маленький — шлём прямо в Telegram
                 await status_msg.edit_text(f"{platform}\n📤 Отправляю...")
                 with open(filepath, 'rb') as f:
                     await update.message.reply_video(
@@ -114,7 +131,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 await status_msg.delete()
             else:
-                # Большой — заливаем на gofile.io
                 await status_msg.edit_text(f"{platform}\n☁️ Загружаю на хостинг ({filesize/1024/1024:.0f}MB)...")
                 download_url = upload_to_gofile(filepath)
                 await status_msg.edit_text(
@@ -127,9 +143,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         err = str(e)
         logger.error(f"Error: {e}", exc_info=True)
         if 'Sign in' in err or 'confirm you' in err:
-            await status_msg.edit_text("❌ YouTube требует авторизацию.\nПопробуй другое видео.")
+            await status_msg.edit_text("❌ Видео недоступно — возможно оно приватное или с возрастным ограничением.")
         elif 'format is not available' in err:
-            await status_msg.edit_text("❌ Видео недоступно в этом регионе.")
+            await status_msg.edit_text("❌ Формат недоступен. Попробуй другое видео.")
         elif 'Conflict' in err:
             await status_msg.edit_text("❌ Бот запущен в двух местах одновременно.")
         elif 'Gofile' in err:
